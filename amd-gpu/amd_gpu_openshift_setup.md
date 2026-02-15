@@ -26,7 +26,7 @@ Three operators work in sequence to expose the GPU to OpenShift workloads:
 
 | Operator | Role |
 |---|---|
-| Node Feature Discovery (NFD) | Scans PCI bus, labels node with `feature.node.kubernetes.io/pci-1002.present=true` |
+| Node Feature Discovery (NFD) | Scans PCI bus, labels node with `feature.node.kubernetes.io/pci-1002.present=true` (for reference `feature.node.kubernetes.io/pci-10de.present=true` (10de is NVIDIA's vendor ID).) |
 | Kernel Module Management (KMM) | Builds and loads the `amdgpu` kernel module into the immutable CoreOS node |
 | AMD GPU Operator | Deploys device plugin so pods can request `amd.com/gpu: 1` as a resource |
 
