@@ -14,11 +14,12 @@
 
 This guide covers the complete setup from a GPU that is already physically installed and visible in the host OS, through to a working ROCm compute environment inside OpenShift Single Node OpenShift (SNO). It assumes the GPU passthrough to the libvirt VM has already been configured (IOMMU, vfio-pci binding, VM XML). For that prior work, see the companion document *AMD GPU Passthrough on Fedora (EPYC/Supermicro H11SSL-i)*.
 
-The guide is split into three phases:
+The guide is split into four phases:
 
 - **Phase 1:** Verify the GPU is healthy on the host and visible inside the VM
 - **Phase 2:** Install the three required OpenShift operators via OperatorHub GUI
 - **Phase 3:** Configure the operators and verify ROCm GPU compute works
+- **Phase 4:** Deploy Ollama with GPU inference and Open WebUI chat frontend
 
 ### Architecture Overview
 
@@ -402,13 +403,337 @@ Agent 2
 
 ---
 
+## Phase 4: Ollama GPU Inference + Open WebUI
+
+This phase deploys Ollama (LLM inference server) using the AMD GPU for acceleration, with Open WebUI as the chat frontend. Prerequisites: Phase 3 complete, GPU schedulable as `amd.com/gpu: 1`, LVMS storage available.
+
+### Step 12 — Prevent GPU Runtime PM Suspend (Critical)
+
+The RX 6600 SMU firmware mismatch causes the GPU to enter an unrecoverable error state if the kernel's runtime power management suspends it. The GPU resumes with `gfx_v10_0 failed -110`, making `/dev/dri/renderD129` return `EINVAL` on every open call until the node is rebooted.
+
+Apply this MachineConfig **before** deploying any GPU workloads:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-amdgpu-norunpm
+  labels:
+    machineconfiguration.openshift.io/role: master
+spec:
+  kernelArguments:
+    - amdgpu.runpm=0
+EOF
+```
+
+Wait for the node to reboot and MCP to settle:
+
+```bash
+watch -n5 "oc get mcp master"
+# Wait until: UPDATED=True  UPDATING=False  DEGRADED=False
+```
+
+Verify after reboot:
+
+```bash
+oc debug node/sno1.local.momolab.io -- nsenter -a -t 1 -- sh -c "
+  cat /proc/cmdline | grep -o 'amdgpu.runpm=0' && echo 'kernel arg OK'
+  cat /sys/bus/pci/devices/0000:08:00.0/power/runtime_status
+  dd if=/dev/dri/renderD129 bs=1 count=0 2>&1 && echo 'renderD129 OK'
+"
+# Expected: amdgpu.runpm=0 kernel arg OK / active / renderD129 OK
+```
+
+### Step 13 — Mirror the Ollama ROCm Image
+
+The `ollama:rocm` image bundles the ROCm runtime. Mirror it to your local registry:
+
+```bash
+podman pull docker.io/ollama/ollama:rocm
+podman tag docker.io/ollama/ollama:rocm quay.local.momolab.io/mirror/ollama-chat/ollama:rocm
+podman push --authfile=/home/momo/auth.json quay.local.momolab.io/mirror/ollama-chat/ollama:rocm
+```
+
+Also mirror Open WebUI:
+
+```bash
+podman pull ghcr.io/open-webui/open-webui:main
+podman tag ghcr.io/open-webui/open-webui:main quay.local.momolab.io/mirror/ollama-chat/open-webui:main
+podman push --authfile=/home/momo/auth.json quay.local.momolab.io/mirror/ollama-chat/open-webui:main
+```
+
+### Step 14 — Create Namespace, PVCs, and Service Accounts
+
+```bash
+oc new-project ollama-chat
+
+# PVCs
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: ollama-chat
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: lvms-vg1
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-webui-data
+  namespace: ollama-chat
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: lvms-vg1
+  resources:
+    requests:
+      storage: 5Gi
+EOF
+
+# Service accounts with anyuid SCC
+oc create serviceaccount ollama -n ollama-chat
+oc create serviceaccount open-webui -n ollama-chat
+oc adm policy add-scc-to-user anyuid -z ollama -n ollama-chat
+oc adm policy add-scc-to-user anyuid -z open-webui -n ollama-chat
+```
+
+> **Note:** PVCs will remain `Pending` (WaitForFirstConsumer) until a pod is scheduled — this is normal for LVMS.
+
+### Step 15 — Deploy Ollama with GPU
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ollama-chat
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: ollama
+  template:
+    metadata:
+      labels:
+        app: ollama
+    spec:
+      serviceAccountName: ollama
+      containers:
+        - name: ollama
+          image: quay.local.momolab.io/mirror/ollama-chat/ollama:rocm
+          ports:
+            - containerPort: 11434
+          env:
+            - name: OLLAMA_HOST
+              value: "0.0.0.0"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "2"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+            - name: HSA_OVERRIDE_GFX_VERSION
+              value: "10.3.0"
+            - name: LD_LIBRARY_PATH
+              value: "/usr/lib/ollama:/usr/lib/ollama/rocm"
+          resources:
+            requests:
+              memory: "8Gi"
+              cpu: "4"
+              amd.com/gpu: "1"
+            limits:
+              memory: "16Gi"
+              cpu: "8"
+              amd.com/gpu: "1"
+          volumeMounts:
+            - name: ollama-models
+              mountPath: /root/.ollama
+      volumes:
+        - name: ollama-models
+          persistentVolumeClaim:
+            claimName: ollama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ollama-chat
+spec:
+  selector:
+    app: ollama
+  ports:
+    - port: 11434
+      targetPort: 11434
+EOF
+```
+
+> **Important:** `strategy.type: Recreate` is required. `amd.com/gpu: 1` is an exclusive resource — RollingUpdate will deadlock because the new pod cannot claim the GPU until the old pod releases it.
+
+> **`HSA_OVERRIDE_GFX_VERSION=10.3.0`** tells the ROCm HSA runtime to treat the RX 6600 (gfx1032) as gfx1030-family, which has full ROCm support. Required for Navi 23.
+
+> **`LD_LIBRARY_PATH`** ensures Ollama's subprocess runner can find `libggml-base.so.0` alongside the ROCm libraries. Without this, Ollama skips the ROCm backend entirely.
+
+> **Do not set `OLLAMA_LLM_LIBRARY=hip`** — this causes Ollama to skip the hip library rather than use it.
+
+### Step 16 — Load a Model
+
+Copy a model from your workstation to the pod (model must already be pulled with `ollama pull` on the workstation):
+
+```bash
+OLLAMA_POD=$(oc get pod -l app=ollama -n ollama-chat --field-selector=status.phase=Running -o name | sed 's|pod/||')
+
+oc cp /usr/share/ollama/.ollama/models/blobs/. ${OLLAMA_POD}:/root/.ollama/models/blobs/ -n ollama-chat
+oc cp /usr/share/ollama/.ollama/models/manifests/. ${OLLAMA_POD}:/root/.ollama/models/manifests/ -n ollama-chat
+
+# Verify the model is registered
+oc exec -it ${OLLAMA_POD} -n ollama-chat -- ollama list
+```
+
+### Step 17 — Verify GPU Inference
+
+Check Ollama startup logs for GPU detection:
+
+```bash
+oc logs ${OLLAMA_POD} -n ollama-chat | grep -i "inference compute"
+# Expected:
+# inference compute id=0 library=ROCm compute=gfx1030 name=ROCm0 total="8.0 GiB"
+```
+
+Run a test inference and verify VRAM usage:
+
+```bash
+# VRAM before (should be ~16MB idle)
+oc exec -it ${OLLAMA_POD} -n ollama-chat -- sh -c "cat /sys/class/drm/card1/device/mem_info_vram_used"
+
+# Run inference
+oc exec -it ${OLLAMA_POD} -n ollama-chat -- ollama run llama3.2:3b "what is 2+2? answer in one word"
+
+# VRAM after (should be ~3.3GB with llama3.2:3b loaded)
+oc exec -it ${OLLAMA_POD} -n ollama-chat -- sh -c "cat /sys/class/drm/card1/device/mem_info_vram_used"
+```
+
+Check Ollama logs confirm all layers on GPU:
+
+```bash
+oc logs ${OLLAMA_POD} -n ollama-chat | grep -i "offload\|layers\|ROCm"
+# Expected:
+# load_tensors: offloaded 29/29 layers to GPU
+# load_tensors: ROCm0 model buffer size = 1918.35 MiB
+```
+
+### Step 18 — Deploy Open WebUI
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ollama-chat
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      serviceAccountName: open-webui
+      containers:
+        - name: open-webui
+          image: quay.local.momolab.io/mirror/ollama-chat/open-webui:main
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OLLAMA_BASE_URL
+              value: "http://ollama.ollama-chat.svc.cluster.local:11434"
+            - name: WEBUI_SECRET_KEY
+              value: "replace-with-a-random-string"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1"
+          volumeMounts:
+            - name: webui-data
+              mountPath: /app/backend/data
+      volumes:
+        - name: webui-data
+          persistentVolumeClaim:
+            claimName: ollama-webui-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ollama-chat
+spec:
+  selector:
+    app: open-webui
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: open-webui
+  namespace: ollama-chat
+spec:
+  to:
+    kind: Service
+    name: open-webui
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+EOF
+```
+
+Get the URL:
+
+```bash
+oc get route open-webui -n ollama-chat
+# Access at: https://open-webui-ollama-chat.apps.sno1.local.momolab.io
+```
+
+### Performance Reference
+
+Measured on RX 6600 (8GB VRAM) with VFIO passthrough, RHEL CoreOS 9.6, amdgpu stock kernel driver:
+
+| Model | VRAM | Tokens/sec | Notes |
+|---|---|---|---|
+| llama3.2:1b | ~1GB | ~35-40 tok/s | Fast, limited quality |
+| llama3.2:3b | ~2GB | ~15-20 tok/s | Good balance for simple tasks |
+| llama3.1:8b | ~4.7GB | ~5-8 tok/s | Best quality that fits in 8GB VRAM |
+
+> **Note:** Models larger than ~8B parameters at Q4 quantization will not fit in 8GB VRAM. Ollama will split them across GPU+CPU which degrades performance to near-CPU speeds.
+
+> **Clock reporting:** `pp_dpm_sclk` reports 0MHz due to the SMU firmware version mismatch — this is a telemetry failure, not actual clock throttling. The GPU computes at full speed as confirmed by the tokens/second measurements above.
+
+---
+
 ## Troubleshooting Reference
 
 ### Build Failures
 
 | Error | Fix |
 |---|---|
-| `404 for repo.radeon.com/amdgpu/X.X.X/el/9.X` | Driver version does not exist for your OS. Check available versions: `curl -s https://repo.radeon.com/amdgpu/` and pick a version that has your RHEL version under `el/` |
+| `404 for repo.radeon.com/amdgpu/X.X.X/el/9.X` | Driver version does not exist for your OS. The AMD GPU Operator uses the `DRIVERS_VERSION` field directly as a path component (e.g. `6.4.4` → `amdgpu/6.4.4/el/9.6/`). Verify the path exists: `curl -s https://repo.radeon.com/amdgpu/6.4.4/el/9.6/main/x86_64/repodata/repomd.xml -o /dev/null -w "%{http_code}"`. Use `latest` or check `https://repo.radeon.com/amdgpu/` for valid versions. |
+| Build uses wrong OS version (e.g. `el/9.4` instead of `el/9.6`) | The Dockerfile uses `${VERSION_ID}` from `/etc/os-release`. If the build is picking up the wrong version, patch the KMM build ConfigMap directly (scale down the operator first to prevent it overwriting the ConfigMap). |
 | `x509: certificate signed by unknown authority` | CA not trusted by build pod. Ensure your CA is in the cluster additional trusted CA ConfigMap: `oc get image.config.openshift.io/cluster` |
 | `pinging container registry image-registry: no such host` | Internal image registry not enabled. Apply the patch from Step 6. |
 | `expected 0 or 1 BuildImage resources, got 2` | Stale Build objects from a version change. Run: `oc delete build --all -n openshift-amd-gpu` then `oc delete mbsc amd-gpu-config -n openshift-amd-gpu` |
@@ -418,8 +743,9 @@ Agent 2
 | Error | Fix |
 |---|---|
 | `amdgpu: probe of 0000:08:00.0 failed with error -95` | SMU firmware mismatch. Apply the MachineConfig from Step 7 with `ppfeaturemask=0` |
-| `Key was rejected by service` | Kernel lockdown or IMA rejection. Check: `oc debug node/... -- chroot /host cat /sys/kernel/security/lockdown` |
+| `Key was rejected by service` | Secure Boot is rejecting an unsigned KMM-built module. The stock RHEL kernel amdgpu is already signed by Red Hat and loads correctly without KMM building a new module. Do not attempt to upgrade the amdgpu driver via KMM unless you have a MOK enrolled for signing. |
 | `SMU driver if version not matched` | Warning only — non-fatal if followed by `SMU is resumed successfully` with `ppfeaturemask=0` applied |
+| `rlc autoload: gc ucode autoload timeout` followed by `resume of IP block <gfx_v10_0> failed -110` | GPU failed to resume from runtime PM suspend due to SMU mismatch. Apply `amdgpu.runpm=0` kernel argument (Phase 4, Step 12) and reboot. |
 | `feature.node.kubernetes.io/pci-1002.present` missing after reboot | NFD did not rescan. Re-apply manually: `oc label node <node> feature.node.kubernetes.io/pci-1002.present=true` |
 
 ### ROCm Failures
@@ -446,11 +772,13 @@ Agent 2
 
 | Issue | Notes |
 |---|---|
-| SMU firmware version mismatch warning | `amdgpu-dkms 6.4.4` reports version mismatch against GPU SMU firmware `59.49.0`. Non-fatal with `ppfeaturemask=0` — GPU is fully functional for compute. |
+| SMU firmware version mismatch warning | The stock RHEL 9.6 amdgpu driver (5.14 kernel) reports version mismatch against GPU SMU firmware `59.49.0`. Non-fatal — GPU initialises successfully and compute works. DPM clock reporting via `pp_dpm_sclk` shows 0MHz but GPU is actively computing. |
+| Runtime PM suspend/resume failure | With SMU version mismatch, runtime PM suspend triggers a broken resume path (`rlc autoload timeout`, `gfx_v10_0 resume failed -110`). `/dev/dri/renderD129` returns `EINVAL` after this occurs. **Fix:** Apply `amdgpu.runpm=0` kernel argument via MachineConfig (see Phase 4). Requires reboot. |
 | NFD label lost on reboot | In some cases `pci-1002.present` is not re-applied by NFD after a MachineConfig-triggered reboot. Monitor after reboots and re-apply if needed. |
 | `amd-gpu: true` label not from NFD | The `feature.node.kubernetes.io/amd-gpu` label is applied by the AMD GPU Operator node-labeller, not NFD. It requires `amdgpu` to be loaded and `/dev/dri/card1` accessible. |
 | emptyDir registry loses images on pod restart | A registry pod restart loses the built kernel module image. KMM triggers a rebuild automatically. Use PVC storage to avoid this. |
-| Max Clock Freq: 500 MHz | rocminfo reports 500 MHz max compute clock — a VFIO passthrough limitation. SMU cannot fully manage clocks in a VM. GPU is still functional for compute. |
+| KMM-built module rejected by Secure Boot | DKMS-built modules from AMD's repo are unsigned. Secure Boot (enabled by default on OpenShift) rejects them with `Key was rejected by service`. The stock RHEL kernel amdgpu is Red Hat-signed and loads correctly — KMM module upgrade is not required for basic GPU compute. |
+| `pp_dpm_sclk` reports 0MHz | SMU version mismatch prevents DPM telemetry from initialising. GPU is still computing at full speed — this is a reporting failure, not clock throttling. Confirmed by VRAM usage and tokens/second measurements. |
 
 ---
 
@@ -545,6 +873,12 @@ Add the following tasks to your OpenShift post-install playbook (after LVMS is c
 | NFD pods | `oc get pods -n openshift-nfd` |
 | Build status | `oc get builds -n openshift-amd-gpu` |
 | Module images config | `oc describe mic amd-gpu-config -n openshift-amd-gpu \| grep -A3 Status` |
+| GPU runtime PM disabled | `cat /proc/cmdline \| grep amdgpu.runpm` |
+| renderD129 accessible | `dd if=/dev/dri/renderD129 bs=1 count=0 2>&1 && echo OK` |
+| GPU runtime status | `cat /sys/bus/pci/devices/0000:08:00.0/power/runtime_status` (expect: `active`) |
+| Ollama GPU detection | `oc logs <ollama-pod> -n ollama-chat \| grep "inference compute"` |
+| VRAM usage | `oc exec <ollama-pod> -n ollama-chat -- sh -c "cat /sys/class/drm/card1/device/mem_info_vram_used"` |
+| Ollama models loaded | `oc exec <ollama-pod> -n ollama-chat -- ollama list` |
 
 ### Key Resource Names
 
@@ -558,5 +892,14 @@ Add the following tasks to your OpenShift post-install playbook (after LVMS is c
 | Module (created by operator) | `amd-gpu-config` / `openshift-amd-gpu` |
 | ModuleBuildSignConfig | `amd-gpu-config` / `openshift-amd-gpu` |
 | ModuleImagesConfig | `amd-gpu-config` / `openshift-amd-gpu` |
-| MachineConfig | `99-amdgpu-modprobe` / cluster-scoped |
+| MachineConfig (modprobe) | `99-amdgpu-modprobe` / cluster-scoped |
+| MachineConfig (runpm) | `99-amdgpu-norunpm` / cluster-scoped |
 | Internal registry config | `cluster` / `configs.imageregistry.operator.openshift.io` |
+| Ollama Namespace | `ollama-chat` |
+| Ollama Deployment | `ollama` / `ollama-chat` |
+| Ollama Service | `ollama` / `ollama-chat` (port 11434) |
+| Ollama Models PVC | `ollama-models` / `ollama-chat` (50Gi) |
+| Open WebUI Deployment | `open-webui` / `ollama-chat` |
+| Open WebUI Service | `open-webui` / `ollama-chat` (port 8080) |
+| Open WebUI Data PVC | `ollama-webui-data` / `ollama-chat` (5Gi) |
+| Open WebUI Route | `open-webui` / `ollama-chat` |
