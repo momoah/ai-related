@@ -34,12 +34,12 @@ RUN npm install -g --force openclaw@latest && \
 RUN chown -R openclaw:0 /app
 USER 1001
 
-# Run setup and explore the configuration
+# Create a basic configuration
 RUN openclaw setup && \
-    openclaw config && \
-    openclaw gateway --help
+    openclaw config set gateway.mode local
 
 # Expose port
 EXPOSE 3000
 
-CMD ["openclaw", "gateway", "--port", "3000", "--allow-unconfigured"]
+CMD ["openclaw", "gateway", "--port", "3000", "--allow-unconfigured", "--auth", "token", "--token", "openclaw-token-123"]
+
