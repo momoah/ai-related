@@ -1,13 +1,13 @@
-# This builds, still testing functionality.
-
 FROM registry.access.redhat.com/ubi9/ubi-minimal
 
-# Install git, build tools, and other dependencies
+# Install only essential build tools and clean up in the same layer
 RUN microdnf install -y git tar xz make gcc gcc-c++ python3 cmake && \
-    microdnf clean all
+    microdnf clean all && \
+    rm -rf /var/cache/microdnf/*
 
-# Download and install Node.js 22 manually (required by OpenClaw)
-RUN curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz | tar -xJ -C /usr/local --strip-components=1
+# Download and install Node.js 22 manually
+RUN curl -fsSL https://nodejs.org/dist/v22.12.0/node-v22.12.0-linux-x64.tar.xz | tar -xJ -C /usr/local --strip-components=1 && \
+    npm cache clean --force
 
 # Create a non-root user
 RUN useradd -u 1001 -r -g 0 -m -s /sbin/nologin -c "Default Application User" openclaw && \
@@ -20,20 +20,26 @@ WORKDIR /app
 # Configure npm to use HTTPS instead of SSH for GitHub
 RUN git config --global url."https://github.com/".insteadOf ssh://git@github.com/
 
-# Install OpenClaw manually with additional flags
+# Install OpenClaw and clean up
 USER 0
 RUN npm install -g --force openclaw@latest && \
     PLUGIN_FILE="$(npm root -g)/openclaw/extensions/minimax-portal-auth/index.ts" && \
     if [ -f "$PLUGIN_FILE" ]; then sed -i.bak 's/clawdbot\/plugin-sdk/openclaw\/plugin-sdk/g' "$PLUGIN_FILE"; fi && \
-    openclaw plugins enable minimax-portal-auth
+    openclaw plugins enable minimax-portal-auth && \
+    npm cache clean --force && \
+    rm -rf /root/.npm && \
+    rm -rf /usr/share/man /usr/share/doc
 
 # Change ownership to non-root user
 RUN chown -R openclaw:0 /app
 USER 1001
 
-# Expose port (adjust if needed)
+# Run setup and explore the configuration
+RUN openclaw setup && \
+    openclaw config && \
+    openclaw gateway --help
+
+# Expose port
 EXPOSE 3000
 
-# Start the application
-CMD ["npm", "start"]
-
+CMD ["openclaw", "gateway", "--port", "3000", "--allow-unconfigured"]
