@@ -1,0 +1,48 @@
+{
+  "auth": {
+    "profiles": {
+      "ollama:manual": {
+        "provider": "ollama",
+        "mode": "token"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "ollama": {
+        "baseUrl": "http://host.containers.internal:11434",
+        "models": [
+          {
+            "id": "llama3.2",
+            "name": "llama3.2"
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "ollama/llama3.2"
+      }
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "gateway": {
+    "port": 3000,
+    "mode": "local",
+    "bind": "lan",
+    "auth": {
+      "token": "4561d0bcd74b22791ca4b0ebf412363c493730b04bb65d31bce2e33dc37b63a1"
+    },
+    "controlUi": {
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  }
+}
+

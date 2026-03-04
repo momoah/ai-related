@@ -1,0 +1,47 @@
+[momo@modora letsencrypt]$ podman ps
+CONTAINER ID  IMAGE                      COMMAND         CREATED             STATUS             PORTS                   NAMES
+f44bc8df6f01  localhost/openclaw:latest  /entrypoint.sh  About a minute ago  Up About a minute  0.0.0.0:3000->3000/tcp  ecstatic_lehmann
+[momo@modora letsencrypt]$ podman exec -it ecstatic_lehmann /bin/bash
+[openclaw@f44bc8df6f01 app]$ openclaw devices list
+
+🦞 OpenClaw 2026.3.1 (2a8ac97) — The UNIX philosophy meets your DMs.
+
+│
+◇  
+Pending (1)
+┌──────────────────────────────────────┬────────────────────────────────────────────────────────────────┬──────────┬────────────┬──────────┬────────┐
+│ Request                              │ Device                                                         │ Role     │ IP         │ Age      │ Flags  │
+├──────────────────────────────────────┼────────────────────────────────────────────────────────────────┼──────────┼────────────┼──────────┼────────┤
+│ 8dd17a29-8294-4806-b378-25d0c8ca3b19 │ 5ab67ea95a14eca6a24f1d01c00268562500b0fddb486bb35dcdb7b15de868 │ operator │ 10.0.2.100 │ just now │        │
+│                                      │ ee                                                             │          │            │          │        │
+└──────────────────────────────────────┴────────────────────────────────────────────────────────────────┴──────────┴────────────┴──────────┴────────┘
+Paired (1)
+┌────────────────────────────────────────────┬────────────┬───────────────────────────────────────────────────────────────┬────────────┬────────────┐
+│ Device                                     │ Roles      │ Scopes                                                        │ Tokens     │ IP         │
+├────────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────────┼────────────┼────────────┤
+│ 9da368ea25370909940b105a17b8dae61fc6e78707 │ operator   │ operator.admin, operator.read, operator.write, operator.      │ operator   │            │
+│ 3d99f3746f1279af257c1d                     │            │ approvals, operator.pairing                                   │            │            │
+└────────────────────────────────────────────┴────────────┴───────────────────────────────────────────────────────────────┴────────────┴────────────┘
+[openclaw@f44bc8df6f01 app]$ openclaw devices approve 8dd17a29-8294-4806-b378-25d0c8ca3b19
+
+🦞 OpenClaw 2026.3.1 (2a8ac97) — The UNIX philosophy meets your DMs.
+
+│
+◇  
+Approved 5ab67ea95a14eca6a24f1d01c00268562500b0fddb486bb35dcdb7b15de868ee (8dd17a29-8294-4806-b378-25d0c8ca3b19)
+[openclaw@f44bc8df6f01 app]$ openclaw devices list
+
+🦞 OpenClaw 2026.3.1 (2a8ac97) — Welcome to the command line: where dreams compile and confidence segfaults.
+
+│
+◇  
+Paired (2)
+┌────────────────────────────────────────────┬────────────┬───────────────────────────────────────────────────────────────┬────────────┬────────────┐
+│ Device                                     │ Roles      │ Scopes                                                        │ Tokens     │ IP         │
+├────────────────────────────────────────────┼────────────┼───────────────────────────────────────────────────────────────┼────────────┼────────────┤
+│ 5ab67ea95a14eca6a24f1d01c00268562500b0fddb │ operator   │ operator.admin, operator.approvals, operator.pairing          │ operator   │ 10.0.2.100 │
+│ 486bb35dcdb7b15de868ee                     │            │                                                               │            │            │
+│ 9da368ea25370909940b105a17b8dae61fc6e78707 │ operator   │ operator.admin, operator.read, operator.write, operator.      │ operator   │            │
+│ 3d99f3746f1279af257c1d                     │            │ approvals, operator.pairing                                   │            │            │
+└────────────────────────────────────────────┴────────────┴───────────────────────────────────────────────────────────────┴────────────┴────────────┘
+
